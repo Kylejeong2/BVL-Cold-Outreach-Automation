@@ -6,7 +6,9 @@ export async function POST(request: Request) {
     console.log('Search query:', query)
 
     // Call Exa AI API for LinkedIn search
-    const exaResponse = await fetch('https://api.exa.ai/search/linkedin', {
+    // Example query builder
+    // https://dashboard.exa.ai/playground/search?q=Best%20computer%20scientist%20working%20at%20Stanford%20&c=linkedin%20profile&filters=%7B%22type%22:%22auto%22,%22text%22:%22true%22%7D
+    const exaResponse = await fetch('https://api.exa.ai/search', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -14,6 +16,7 @@ export async function POST(request: Request) {
       },
       body: JSON.stringify({
         query,
+        category: 'linkedin profile',
         useAutoprompt: true,
         max_results: 10
       })
@@ -32,59 +35,60 @@ export async function POST(request: Request) {
       return NextResponse.json([])
     }
     
-    // Process each LinkedIn profile through Apollo.io
-    const enrichedData = await Promise.all(
-      exaData.results.map(async (profile: any) => {
-        console.log('Processing profile:', profile.url)
-        
-        try {
-          const apolloResponse = await fetch('https://api.apollo.io/v1/mixed_people/search', {
-            method: 'POST',
-            headers: {
-              'Cache-Control': 'no-cache',
-              'Content-Type': 'application/json',
-              'Api-Key': process.env.APOLLO_API_KEY!
-            },
-            body: JSON.stringify({
-              api_key: process.env.APOLLO_API_KEY,
-              q_organization_domains: [],
-              page: 1,
-              person_criteria: {
-                linkedin_url: profile.url
-              }
-            })
-          })
+    // Process LinkedIn profiles in bulk through Apollo.io
+    try {
+      const apolloResponse = await fetch('https://api.apollo.io/api/v1/people/bulk_match', {
+        method: 'POST',
+        headers: {
+          'Cache-Control': 'no-cache',
+          'Content-Type': 'application/json',
+          'Api-Key': process.env.APOLLO_API_KEY!
+        },
+        body: JSON.stringify({
+          api_key: process.env.APOLLO_API_KEY,
+          details: exaData.results.map((profile: any) => ({
+            linkedin_url: profile.url
+          }))
+        })
+      })
 
-          if (!apolloResponse.ok) {
-            console.error('Apollo API error:', await apolloResponse.text())
-            return {
-              email: 'N/A',
-              linkedinUrl: profile.url,
-              position: profile.title || 'N/A'
-            }
-          }
-
-          const apolloData = await apolloResponse.json()
-          console.log('Apollo API response for', profile.url, ':', apolloData)
-          
-          const person = apolloData.people?.[0]
-          return {
-            email: person?.email || 'N/A',
-            linkedinUrl: profile.url,
-            position: person?.title || profile.title || 'N/A'
-          }
-        } catch (error) {
-          console.error('Error enriching profile:', profile.url, error)
-          return {
+      if (!apolloResponse.ok) {
+        console.error('Apollo API error:', await apolloResponse.text())
+        return NextResponse.json(
+          exaData.results.map((profile: any) => ({
+            name: profile.author || 'N/A',
             email: 'N/A',
             linkedinUrl: profile.url,
             position: profile.title || 'N/A'
-          }
+          }))
+        )
+      }
+
+      const apolloData = await apolloResponse.json()
+      console.log('Apollo Bulk API response:', apolloData)
+      
+      const enrichedData = exaData.results.map((profile: any, index: number) => {
+        const match = apolloData.matches?.[index]
+        return {
+          name: profile.author || match?.name || 'N/A',
+          email: match?.email || 'N/A',
+          linkedinUrl: profile.url,
+          position: match?.title || profile.title || 'N/A'
         }
       })
-    )
 
-    return NextResponse.json(enrichedData)
+      return NextResponse.json(enrichedData)
+    } catch (error) {
+      console.error('Error in bulk enrichment:', error)
+      return NextResponse.json(
+        exaData.results.map((profile: any) => ({
+          name: profile.author || 'N/A',
+          email: 'N/A',
+          linkedinUrl: profile.url,
+          position: profile.title || 'N/A'
+        }))
+      )
+    }
   } catch (error) {
     console.error('Search error:', error)
     if (error instanceof Error) {
