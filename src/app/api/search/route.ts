@@ -1,13 +1,10 @@
 import { NextResponse } from 'next/server'
 
-export async function POST(request: Request) {
-  try {
-    const { query } = await request.json()
-    console.log('Search query:', query)
+// Helper to delay between API calls
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
-    // Call Exa AI API for LinkedIn search
-    // Example query builder
-    // https://dashboard.exa.ai/playground/search?q=Best%20computer%20scientist%20working%20at%20Stanford%20&c=linkedin%20profile&filters=%7B%22type%22:%22auto%22,%22text%22:%22true%22%7D
+async function searchExa(query: string) {
+  try {
     const exaResponse = await fetch('https://api.exa.ai/search', {
       method: 'POST',
       headers: {
@@ -22,73 +19,137 @@ export async function POST(request: Request) {
       })
     })
 
+    if (!exaResponse.ok) {
+      console.error(`Exa API error for query "${query}":`, await exaResponse.text())
+      return []
+    }
+
     const exaData = await exaResponse.json()
-    console.log('Exa API response:', JSON.stringify(exaData, null, 2))
-
     if (!exaData || !exaData.results) {
-      console.error('Invalid Exa API response:', exaData)
-      return NextResponse.json({ error: 'Invalid response from Exa API' }, { status: 500 })
+      console.error(`Invalid Exa API response for query "${query}":`, exaData)
+      return []
     }
 
-    if (exaData.results.length === 0) {
-      console.log('No results found for query')
-      return NextResponse.json([])
-    }
-    
-    // Process LinkedIn profiles in bulk through Apollo.io
-    try {
-      const apolloResponse = await fetch('https://api.apollo.io/api/v1/people/bulk_match', {
-        method: 'POST',
-        headers: {
-          'Cache-Control': 'no-cache',
-          'Content-Type': 'application/json',
-          'Api-Key': process.env.APOLLO_API_KEY!
-        },
-        body: JSON.stringify({
-          api_key: process.env.APOLLO_API_KEY,
-          details: exaData.results.map((profile: any) => ({
-            linkedin_url: profile.url
-          }))
-        })
+    return exaData.results
+  } catch (error) {
+    console.error(`Error in Exa search for query "${query}":`, error)
+    return []
+  }
+}
+
+async function enrichWithApollo(profiles: any[]) {
+  if (profiles.length === 0) return []
+
+  try {
+    const apolloResponse = await fetch('https://api.apollo.io/api/v1/people/bulk_match', {
+      method: 'POST',
+      headers: {
+        'Cache-Control': 'no-cache',
+        'Content-Type': 'application/json',
+        'Api-Key': process.env.APOLLO_API_KEY!
+      },
+      body: JSON.stringify({
+        api_key: process.env.APOLLO_API_KEY,
+        details: profiles.map((profile: any) => ({
+          linkedin_url: profile.url
+        }))
       })
+    })
 
-      if (!apolloResponse.ok) {
-        console.error('Apollo API error:', await apolloResponse.text())
-        return NextResponse.json(
-          exaData.results.map((profile: any) => ({
-            name: profile.author || 'N/A',
-            email: 'N/A',
-            linkedinUrl: profile.url,
-            position: profile.title || 'N/A'
-          }))
-        )
+    if (!apolloResponse.ok) {
+      console.error('Apollo API error:', await apolloResponse.text())
+      throw new Error('Apollo API error')
+    }
+
+    const apolloData = await apolloResponse.json()
+    return profiles.map((profile: any, index: number) => {
+      const match = apolloData.matches?.[index]
+      return {
+        name: profile.author || match?.name || 'N/A',
+        email: match?.email || 'N/A',
+        linkedinUrl: profile.url,
+        position: match?.title || profile.title || 'N/A'
+      }
+    })
+  } catch (error) {
+    console.error('Error in Apollo enrichment:', error)
+    // Return non-enriched profiles as fallback
+    return profiles.map(profile => ({
+      name: profile.author || 'N/A',
+      email: 'N/A',
+      linkedinUrl: profile.url,
+      position: profile.title || 'N/A'
+    }))
+  }
+}
+
+export async function POST(request: Request) {
+  try {
+    const { query } = await request.json()
+
+    // Generate query variations
+    const variationsResponse = await fetch(`${request.url.split('/api/')[0]}/api/generate-queries`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ query })
+    })
+
+    if (!variationsResponse.ok) {
+      throw new Error('Failed to generate query variations')
+    }
+
+    const { queries } = await variationsResponse.json()
+    const allQueries = [query, ...queries] // Include original query
+
+    // Process queries in smaller batches with delays
+    const batchSize = 5 // Reduced batch size
+    const allResults = new Set<string>() // Use Set to track unique LinkedIn URLs
+    const enrichedResults = []
+
+    for (let i = 0; i < allQueries.length && allResults.size < 1000; i += batchSize) {
+      // Add delay between batches to prevent rate limiting
+      if (i > 0) {
+        await delay(1000) // 1 second delay between batches
       }
 
-      const apolloData = await apolloResponse.json()
-      console.log('Apollo Bulk API response:', apolloData)
-      
-      const enrichedData = exaData.results.map((profile: any, index: number) => {
-        const match = apolloData.matches?.[index]
-        return {
-          name: profile.author || match?.name || 'N/A',
-          email: match?.email || 'N/A',
-          linkedinUrl: profile.url,
-          position: match?.title || profile.title || 'N/A'
+      const batchQueries = allQueries.slice(i, i + batchSize)
+      const batchResults = await Promise.all(
+        batchQueries.map(async (q, index) => {
+          // Add small delay between queries in the same batch
+          if (index > 0) {
+            await delay(200) // 200ms delay between queries
+          }
+          return searchExa(q)
+        })
+      )
+
+      // Flatten and deduplicate results
+      const uniqueProfiles = batchResults.flat().filter(profile => {
+        if (!profile.url || allResults.has(profile.url)) {
+          return false
         }
+        allResults.add(profile.url)
+        return true
       })
 
-      return NextResponse.json(enrichedData)
-    } catch (error) {
-      console.error('Error in bulk enrichment:', error)
-      return NextResponse.json(
-        exaData.results.map((profile: any) => ({
-          name: profile.author || 'N/A',
-          email: 'N/A',
-          linkedinUrl: profile.url,
-          position: profile.title || 'N/A'
-        }))
-      )
+      if (uniqueProfiles.length > 0) {
+        // Enrich unique profiles in batches of 10
+        for (let j = 0; j < uniqueProfiles.length; j += 10) {
+          await delay(500) // 500ms delay between Apollo API calls
+          const enrichBatch = uniqueProfiles.slice(j, j + 10)
+          const enriched = await enrichWithApollo(enrichBatch)
+          enrichedResults.push(...enriched)
+        }
+      }
     }
+
+    if (enrichedResults.length === 0) {
+      return NextResponse.json({ error: 'No results found' }, { status: 404 })
+    }
+
+    return NextResponse.json(enrichedResults)
   } catch (error) {
     console.error('Search error:', error)
     if (error instanceof Error) {
