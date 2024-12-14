@@ -1,0 +1,25 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Application {
+  id              String   @id @default(uuid())
+  timestamp       DateTime @default(now())
+  candidateName   String
+  email          String
+  responses      Json
+  
+  // AI Analysis
+  firstAnalysis  Json?
+  secondAnalysis Json?
+  finalStatus    String
+  needsManualReview Boolean @default(true)
+  
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+} 
